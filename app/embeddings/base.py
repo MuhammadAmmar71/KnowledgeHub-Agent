@@ -15,4 +15,14 @@ class EmbeddingProvider(Protocol):
     @property
     def dimensions(self) -> int: ...
 
-    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embeds document/chunk texts."""
+        ...
+
+    async def embed_query(self, query: str) -> list[float]:
+        """
+        Embeds a search query. Separate from embed() because retrieval
+        models like bge expect queries and passages to be encoded
+        differently (an instruction prefix on the query side only).
+        """
+        ...

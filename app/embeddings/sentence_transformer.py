@@ -9,12 +9,16 @@ pulls in torch and (on first ever run) downloads weights, neither of which
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+
+logger = logging.getLogger("knowledge_agent.embeddings.sentence_transformer")
 
 
 class SentenceTransformerProvider:
-    def __init__(self, model_name: str, device: str = "cpu", batch_size: int = 32):
+    def __init__(self, model_name: str, device: str = "cpu", batch_size: int = 32, query_instruction: str = ""):
         self.model_name = model_name
+        self._query_instruction = query_instruction
         self._device = device
         self._batch_size = batch_size
         self._model = None
@@ -24,10 +28,21 @@ class SentenceTransformerProvider:
         if self._model is None:
             with self._load_lock:
                 if self._model is None:
-                    from sentence_transformers import SentenceTransformer
-
-                    self._model = SentenceTransformer(self.model_name, device=self._device)
+                    self._model = self._load()
         return self._model
+
+    def _load(self):
+        from sentence_transformers import SentenceTransformer
+
+        # Cache first: once downloaded, loading must not depend on
+        # huggingface.co being reachable (otherwise every CLI call and
+        # sync pays for an update check, and a network blip means retries
+        # or failure). Only a model that isn't cached yet gets downloaded.
+        try:
+            return SentenceTransformer(self.model_name, device=self._device, local_files_only=True)
+        except Exception:  # noqa: BLE001 -- not cached (raised type varies by hub version)
+            logger.info("embedding_model_not_cached_downloading model=%s", self.model_name)
+            return SentenceTransformer(self.model_name, device=self._device)
 
     @property
     def dimensions(self) -> int:
@@ -51,3 +66,7 @@ class SentenceTransformerProvider:
         # CPU-bound inference -- run it off the event loop so API requests
         # stay responsive while a large batch is embedding (Rule 13).
         return await asyncio.to_thread(self._encode, texts)
+
+    async def embed_query(self, query: str) -> list[float]:
+        vectors = await self.embed([f"{self._query_instruction}{query}"])
+        return vectors[0]

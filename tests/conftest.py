@@ -47,6 +47,9 @@ class FakeEmbeddingProvider:
             raise RuntimeError(f"fake provider failure on '{self.fail_on}'")
         return [self._vector(t) for t in texts]
 
+    async def embed_query(self, query: str) -> list[float]:
+        return (await self.embed([query]))[0]
+
     def _vector(self, text: str) -> list[float]:
         import hashlib
 

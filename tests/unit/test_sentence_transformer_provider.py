@@ -16,7 +16,13 @@ from app.embeddings.sentence_transformer import SentenceTransformerProvider
 class _StubModel:
     instances = 0
 
-    def __init__(self, model_name, device):
+    cached = True
+    load_calls: list = []
+
+    def __init__(self, model_name, device, local_files_only=False):
+        _StubModel.load_calls.append(local_files_only)
+        if local_files_only and not _StubModel.cached:
+            raise OSError("not in local cache")
         _StubModel.instances += 1
         self.model_name = model_name
         self.device = device
@@ -35,6 +41,8 @@ class _StubModel:
 @pytest.fixture
 def stub_sentence_transformers(monkeypatch):
     _StubModel.instances = 0
+    _StubModel.cached = True
+    _StubModel.load_calls = []
     module = types.ModuleType("sentence_transformers")
     module.SentenceTransformer = _StubModel
     monkeypatch.setitem(sys.modules, "sentence_transformers", module)
@@ -70,3 +78,17 @@ async def test_empty_input_does_not_load_model(stub_sentence_transformers):
     provider = SentenceTransformerProvider("some/model")
     assert await provider.embed([]) == []
     assert stub_sentence_transformers.instances == 0
+
+
+@pytest.mark.asyncio
+async def test_cached_model_loads_without_network(stub_sentence_transformers):
+    await SentenceTransformerProvider("some/model").embed(["a"])
+    assert stub_sentence_transformers.load_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_uncached_model_falls_back_to_download(stub_sentence_transformers):
+    stub_sentence_transformers.cached = False
+    await SentenceTransformerProvider("some/model").embed(["a"])
+    assert stub_sentence_transformers.load_calls == [True, False]
+    assert stub_sentence_transformers.instances == 1

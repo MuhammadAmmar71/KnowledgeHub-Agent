@@ -6,7 +6,7 @@ environment variables / .env, and never hardcode tenant-specific values.
 """
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,6 +45,29 @@ class Settings(BaseSettings):
     embedding_device: str = "cpu"
     # Run the embedding stage automatically at the end of every sync run.
     embed_after_sync: bool = True
+    # bge models are trained with this instruction prepended to *queries*
+    # only (documents are embedded as-is). Set to "" for models without one.
+    embedding_query_instruction: str = "Represent this sentence for searching relevant passages: "
+
+    # --- Search (Phase 8) ---
+    search_default_top_k: int = 5
+
+    # --- LLM / RAG answers (Phase 9) ---
+    # Azure OpenAI v1 API (Responses API, no api-version needed). The full
+    # ".../openai/v1/responses" URI is accepted too; the client normalizes it.
+    azure_openai_endpoint: str = "https://auximoplayground-llm.openai.azure.com/openai/v1"
+    # Optional so the rest of the app (sync, search) runs without it; the
+    # ask command fails with a clear message if it's missing.
+    azure_openai_api_key: SecretStr | None = None
+    # The Azure *deployment* name, sent as "model".
+    azure_openai_deployment: str = "gpt-4o"
+    # 0 = least improvisation; answers should restate sources, not embellish them.
+    llm_temperature: float = 0.0
+    llm_max_output_tokens: int = 1200
+    llm_timeout_seconds: float = 90.0
+    llm_max_retries: int = 3
+    # Chunks retrieved as context for one answer.
+    rag_top_k: int = 8
 
     # --- Sync behavior ---
     sync_interval_hours: int = 24

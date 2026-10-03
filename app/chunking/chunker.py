@@ -97,6 +97,29 @@ def _split_into_sections(text: str) -> list[tuple[dict, str]]:
     return sections
 
 
+def _split_by_words(text: str, chunk_size: int) -> list[str]:
+    pieces: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}" if current else word
+        if len(candidate) <= chunk_size:
+            current = candidate
+            continue
+        if current:
+            pieces.append(current)
+        if len(word) <= chunk_size:
+            current = word
+        else:
+            # Last resort: one token longer than a whole chunk (a URL, a
+            # base64 blob) can only be hard-cut.
+            for start in range(0, len(word), chunk_size):
+                pieces.append(word[start:start + chunk_size])
+            current = ""
+    if current:
+        pieces.append(current)
+    return pieces
+
+
 def _split_by_sentences(text: str, chunk_size: int) -> list[str]:
     sentences = re.split(r"(?<=[.!?])\s+", text)
     pieces: list[str] = []
@@ -111,14 +134,41 @@ def _split_by_sentences(text: str, chunk_size: int) -> list[str]:
             if len(sentence) <= chunk_size:
                 current = sentence
             else:
-                # Last resort: a single "sentence" longer than chunk_size
-                # (e.g. no punctuation at all) gets a hard character cut.
-                for start in range(0, len(sentence), chunk_size):
-                    pieces.append(sentence[start:start + chunk_size])
-                current = ""
+                # A single "sentence" longer than chunk_size (no punctuation:
+                # tables, code, lists): split between words.
+                word_pieces = _split_by_words(sentence, chunk_size)
+                pieces.extend(word_pieces[:-1])
+                current = word_pieces[-1] if word_pieces else ""
     if current:
         pieces.append(current)
     return pieces
+
+
+_SENTENCE_START_RE = re.compile(r"(?<=[.!?])\s+")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _overlap_tail(text: str, chunk_overlap: int) -> str:
+    """
+    The last ~chunk_overlap characters of text, trimmed so they start at a
+    clean boundary: the start of a sentence if one begins inside the
+    window, otherwise the start of a word. A raw character slice would
+    usually start mid-word ("ge Docker naming..."), which is noise for
+    both embeddings and anyone reading the chunk.
+    """
+    if len(text) <= chunk_overlap:
+        return text.strip()
+    tail = text[-chunk_overlap:]
+    sentence_break = _SENTENCE_START_RE.search(tail)
+    if sentence_break and tail[sentence_break.end():].strip():
+        return tail[sentence_break.end():].strip()
+    if not text[-chunk_overlap - 1].isspace():
+        # The window starts inside a word -- drop that partial word.
+        word_break = _WHITESPACE_RE.search(tail)
+        if word_break is None:
+            return ""  # one unbroken token longer than the window: no clean overlap
+        tail = tail[word_break.end():]
+    return tail.strip()
 
 
 def _split_oversized(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
@@ -150,8 +200,10 @@ def _split_oversized(text: str, chunk_size: int, chunk_overlap: int) -> list[str
     if chunk_overlap > 0 and len(pieces) > 1:
         overlapped = [pieces[0]]
         for i in range(1, len(pieces)):
-            prev_tail = pieces[i - 1][-chunk_overlap:]
-            overlapped.append(f"{prev_tail}{pieces[i]}")
+            prev_tail = _overlap_tail(pieces[i - 1], chunk_overlap)
+            # Separator matters: without it the overlap's last word fuses
+            # with the next piece's first word.
+            overlapped.append(f"{prev_tail} {pieces[i]}" if prev_tail else pieces[i])
         return overlapped
 
     return pieces

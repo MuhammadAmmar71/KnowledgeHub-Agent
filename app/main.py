@@ -83,6 +83,7 @@ def _get_embedding_provider() -> SentenceTransformerProvider:
             settings.embedding_model_name,
             device=settings.embedding_device,
             batch_size=settings.embedding_batch_size,
+            query_instruction=settings.embedding_query_instruction,
         )
     return _embedding_provider
 
@@ -494,7 +495,7 @@ async def _execute_initial_sync(sync_run_id: uuid.UUID) -> None:
             sync_run = await session.get(SyncRun, sync_run_id)
             if sync_run is not None:
                 sync_run.status = SyncRunStatus.failed
-                sync_run.error_summary = str(exc)[:2000]
+                sync_run.error_summary = f"{type(exc).__name__}: {exc}"[:2000]
                 sync_run.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         finally:
@@ -558,7 +559,7 @@ async def _execute_delta_sync(sync_run_id: uuid.UUID) -> None:
             sync_run = await session.get(SyncRun, sync_run_id)
             if sync_run is not None:
                 sync_run.status = SyncRunStatus.failed
-                sync_run.error_summary = str(exc)[:2000]
+                sync_run.error_summary = f"{type(exc).__name__}: {exc}"[:2000]
                 sync_run.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         finally:
@@ -627,7 +628,7 @@ async def _execute_page_sync(sync_run_id: uuid.UUID) -> None:
             sync_run = await session.get(SyncRun, sync_run_id)
             if sync_run is not None:
                 sync_run.status = SyncRunStatus.failed
-                sync_run.error_summary = str(exc)[:2000]
+                sync_run.error_summary = f"{type(exc).__name__}: {exc}"[:2000]
                 sync_run.completed_at = datetime.now(timezone.utc)
                 await session.commit()
         finally:

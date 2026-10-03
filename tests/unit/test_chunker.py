@@ -76,8 +76,37 @@ def test_oversized_section_is_split_with_overlap():
         # wildly -- this guards against the splitter degenerating into one
         # giant chunk or zero chunks.
         assert len(chunk.content) <= 200 + 20 + 50
-    # Overlap actually overlaps: the tail of chunk N appears at the start of chunk N+1.
-    assert chunks[0].content[-20:] in chunks[1].content
+    # Overlap actually overlaps: chunk N+1 starts with a suffix of chunk N.
+    first_word_of_next = chunks[1].content.split()[0]
+    assert first_word_of_next in chunks[0].content[-40:]
+
+
+def test_overlap_starts_at_word_boundary_and_is_separated():
+    words = " ".join(f"word{i}" for i in range(200))  # no sentence punctuation at all
+    chunks = Chunker(chunk_size=150, chunk_overlap=30).chunk(words, DOC_ID, "hash1")
+
+    assert len(chunks) > 2
+    all_words = set(words.split())
+    for chunk in chunks:
+        # Every token is a whole original word: nothing cut mid-word and
+        # nothing fused with its neighbour.
+        assert set(chunk.content.split()) <= all_words
+
+
+def test_overlap_prefers_sentence_start():
+    from app.chunking.chunker import _overlap_tail
+
+    text = "Alpha beta gamma delta. Second sentence starts here."
+    assert _overlap_tail(text, 35) == "Second sentence starts here."
+
+
+def test_overlap_tail_word_boundary_fallback():
+    from app.chunking.chunker import _overlap_tail
+
+    assert _overlap_tail("one two three four", 9) == "four"       # window "hree four" starts mid-word
+    assert _overlap_tail("one two three four", 10) == "three four"  # window " three four"... exact boundary
+    assert _overlap_tail("x" * 50, 10) == ""                        # unbroken token: no overlap
+    assert _overlap_tail("short", 10) == "short"
 
 
 def test_chunk_indices_are_sequential_across_sections():

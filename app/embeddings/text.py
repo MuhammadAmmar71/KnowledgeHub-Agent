@@ -11,7 +11,7 @@ never modified.
 from __future__ import annotations
 
 
-def _section_label(metadata: dict) -> str | None:
+def section_label(metadata: dict) -> str | None:
     if metadata.get("heading"):
         return str(metadata["heading"])
     if metadata.get("page_number") is not None:
@@ -24,7 +24,7 @@ def _section_label(metadata: dict) -> str | None:
 
 
 def build_embedding_text(content: str, metadata: dict) -> str:
-    context = [part for part in (metadata.get("name"), _section_label(metadata)) if part]
+    context = [part for part in (metadata.get("name"), section_label(metadata)) if part]
     if not context:
         return content
     return f"{' > '.join(context)}\n{content}"
