@@ -1,0 +1,20 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: knowledge_agent
+      POSTGRES_PASSWORD: knowledge_agent
+      POSTGRES_DB: knowledge_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - knowledge_agent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knowledge_agent -d knowledge_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  knowledge_agent_pgdata:
