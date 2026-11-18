@@ -16,6 +16,7 @@ never discard documents that already finished in the same run.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -23,6 +24,7 @@ from app.chunking.chunker import Chunk
 from app.db.models import EMBEDDING_DIMENSIONS, Document, ProcessingStatus
 from app.embeddings.base import EmbeddingProvider
 from app.embeddings.text import build_embedding_text
+from app.observability import EMBEDDING_BATCH_SECONDS, EMBEDDING_DOCUMENTS
 from app.sync.state import ChunkRepository, DocumentRepository
 
 logger = logging.getLogger("knowledge_agent.embeddings.indexer")
@@ -85,7 +87,9 @@ async def _select_documents(
 async def _embed_texts(provider: EmbeddingProvider, texts: list[str], batch_size: int) -> list[list[float]]:
     vectors: list[list[float]] = []
     for start in range(0, len(texts), batch_size):
+        started = time.perf_counter()
         vectors.extend(await provider.embed(texts[start:start + batch_size]))
+        EMBEDDING_BATCH_SECONDS.observe(time.perf_counter() - started)
     if len(vectors) != len(texts):
         raise RuntimeError(f"provider returned {len(vectors)} vectors for {len(texts)} texts")
     return vectors
@@ -98,6 +102,7 @@ async def _mark_failed(
     logger.error("embedding_failed document_id=%s name=%s error=%s", doc.id, doc.name, exc)
     counters.documents_failed += 1
     counters.errors.append(f"{doc.name} ({doc.id}): {exc}")
+    EMBEDDING_DOCUMENTS.labels(outcome="failed").inc()
     try:
         await doc_repo.rollback()
         await doc_repo.mark_processing_status(doc.id, ProcessingStatus.embedding_failed, str(exc)[:2000])
@@ -127,6 +132,7 @@ async def _persist(
         return
     counters.documents_indexed += 1
     counters.chunks_embedded += len(pending.chunks)
+    EMBEDDING_DOCUMENTS.labels(outcome="indexed").inc()
 
 
 async def _process_group(

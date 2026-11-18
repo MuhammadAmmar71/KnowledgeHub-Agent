@@ -20,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.embeddings.base import EmbeddingProvider
 from app.llm.base import LLMProvider
-from app.retrieval.search import SearchFilters, SearchMode, SearchResult, search_chunks
+from app.retrieval.rerank import Reranker
+from app.retrieval.search import ProjectScope, ScopedSearch, SearchFilters, SearchMode, SearchResult, scoped_search
 
 # Spec section 38. Explicitly frames the retrieved text as excerpts and
 # SharePoint as the authoritative source, never the index itself.
@@ -34,6 +35,9 @@ names, numbers, steps, links, or policies.
 - Every statement must be directly supported by an excerpt. Do not add your own characterisations, \
 benefits, purposes, recommendations, or concluding remarks (e.g. "this improves productivity") unless an \
 excerpt says so. Stay close to the excerpts' own wording.
+- Do not infer relationships or conditions the excerpts don't state: don't turn a list into \
+alternatives ("A or B") or requirements ("all of"), and don't add "only", "must" or "optional". When \
+the excerpt just lists items, present them as a list in the same way.
 - Cite the sources you used with their bracketed numbers, e.g. [1] or [2][3], right after the \
 statements they support.
 - If the excerpts do not contain the answer, say so plainly. If they only partially answer the \
@@ -72,6 +76,7 @@ class RagAnswer:
     cited_numbers: list[int]
     incomplete_reason: str | None = None
     llm_called: bool = True
+    project_scope: ProjectScope | None = None
 
     @property
     def cited_sources(self) -> list[Source]:
@@ -115,8 +120,23 @@ def build_context(sources: list[Source]) -> str:
     return "\n\n=====\n\n".join(blocks)
 
 
-def build_user_input(question: str, sources: list[Source]) -> str:
-    return f"Sources:\n\n{build_context(sources)}\n\n=====\n\nQuestion: {question}"
+def _scope_note(scope: ProjectScope | None) -> str:
+    if scope is None:
+        return ""
+    numbers = ", ".join(scope.project_numbers)
+    if scope.fell_back:
+        # Tell the model, so it doesn't present other projects' content as
+        # being about the one the user asked for.
+        return (
+            f"Note: the question refers to project number(s) {numbers}, but no indexed content is tagged "
+            "with them. The sources below come from a general search and may concern other projects; "
+            "say so if they don't actually cover the requested project.\n\n"
+        )
+    return f"Note: the sources below are restricted to content tagged with project number(s) {numbers}.\n\n"
+
+
+def build_user_input(question: str, sources: list[Source], scope: ProjectScope | None = None) -> str:
+    return f"{_scope_note(scope)}Sources:\n\n{build_context(sources)}\n\n=====\n\nQuestion: {question}"
 
 
 def extract_citations(answer: str, valid_numbers: set[int]) -> list[int]:
@@ -129,7 +149,7 @@ def extract_citations(answer: str, valid_numbers: set[int]) -> list[int]:
     return seen
 
 
-SearchFn = Callable[..., Awaitable[list[SearchResult]]]
+SearchFn = Callable[..., Awaitable[ScopedSearch]]
 
 
 async def answer_question(
@@ -140,19 +160,38 @@ async def answer_question(
     top_k: int = 8,
     mode: SearchMode = SearchMode.hybrid,
     filters: SearchFilters | None = None,
-    search: SearchFn = search_chunks,
+    reranker: Reranker | None = None,
+    rerank_candidates: int = 30,
+    min_relevance: float | None = None,
+    search: SearchFn = scoped_search,
 ) -> RagAnswer:
-    results = await search(session, embedding_provider, question, top_k=top_k, mode=mode, filters=filters)
-    sources = group_sources(results)
+    # With min_relevance set, the reranker can return nothing for an
+    # off-topic question -- which then takes the no-LLM path below. A
+    # project number in the question restricts retrieval to that project.
+    found = await search(
+        session, embedding_provider, question, top_k=top_k, mode=mode, filters=filters,
+        reranker=reranker, rerank_candidates=rerank_candidates, min_relevance=min_relevance,
+    )
+    scope = found.scope
+    sources = group_sources(found.results)
 
     if not sources:
-        return RagAnswer(question=question, answer=NO_CONTEXT_ANSWER, sources=[], cited_numbers=[], llm_called=False)
+        answer = NO_CONTEXT_ANSWER
+        if scope is not None and not scope.fell_back:
+            answer = (
+                f"I couldn't find anything relevant to this question in the content tagged with project "
+                f"{', '.join(scope.project_numbers)}."
+            )
+        return RagAnswer(
+            question=question, answer=answer, sources=[], cited_numbers=[], llm_called=False, project_scope=scope
+        )
 
-    response = await llm.generate(SYSTEM_INSTRUCTIONS, build_user_input(question, sources))
+    response = await llm.generate(SYSTEM_INSTRUCTIONS, build_user_input(question, sources, scope))
     return RagAnswer(
         question=question,
         answer=response.text,
         sources=sources,
         cited_numbers=extract_citations(response.text, {s.number for s in sources}),
         incomplete_reason=response.incomplete_reason,
+        project_scope=scope,
     )

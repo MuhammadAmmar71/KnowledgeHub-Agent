@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import httpx
 
 from app.llm.base import LLMError, LLMResponse
+from app.observability import LLM_REQUEST_SECONDS
 
 logger = logging.getLogger("knowledge_agent.llm.azure_openai")
 
@@ -90,6 +92,13 @@ class AzureOpenAIResponsesClient:
         return min(self._backoff_base * (2 ** attempt), _MAX_BACKOFF_SECONDS)
 
     async def generate(self, instructions: str, user_input: str) -> LLMResponse:
+        started = time.perf_counter()
+        try:
+            return await self._generate(instructions, user_input)
+        finally:
+            LLM_REQUEST_SECONDS.observe(time.perf_counter() - started)
+
+    async def _generate(self, instructions: str, user_input: str) -> LLMResponse:
         payload = {
             "model": self.deployment,
             "instructions": instructions,

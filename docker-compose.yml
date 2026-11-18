@@ -4,10 +4,11 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: knowledge_agent
-      POSTGRES_PASSWORD: knowledge_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-knowledge_agent}
       POSTGRES_DB: knowledge_agent
+    # Loopback only: the database is never reachable from other machines.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - knowledge_agent_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -16,5 +17,20 @@ services:
       timeout: 5s
       retries: 10
 
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://knowledge_agent:${POSTGRES_PASSWORD:-knowledge_agent}@db:5432/knowledge_agent
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - knowledge_agent_hf_cache:/home/agent/.cache/huggingface
+
 volumes:
   knowledge_agent_pgdata:
+  knowledge_agent_hf_cache:

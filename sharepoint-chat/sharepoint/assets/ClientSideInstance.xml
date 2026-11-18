@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Elements xmlns="http://schemas.microsoft.com/sharepoint/">
+    <ClientSideComponentInstance
+        Title="Knowledge Hub Assistant"
+        Location="ClientSideExtension.ApplicationCustomizer"
+        ComponentId="f5ea75ff-309f-4cff-8e72-a06896039b77"
+        Properties="{&quot;apiUrl&quot;:&quot;https://__BACKEND_HOST__/chat&quot;,&quot;apiResource&quot;:&quot;api://cbe2a4b8-2e5f-4f53-98d7-e0492d503896&quot;,&quot;title&quot;:&quot;Knowledge Hub Assistant&quot;}">
+    </ClientSideComponentInstance>
+</Elements>

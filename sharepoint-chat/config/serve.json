@@ -1,0 +1,19 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/spfx-build/spfx-serve.schema.json",
+  "port": 4321,
+  "https": true,
+  "serveConfigurations": {
+    "default": {
+      "pageUrl": "https://auximotechgmbh.sharepoint.com/sites/AuximoKnowledgeHub",
+      "customActions": {
+        "f5ea75ff-309f-4cff-8e72-a06896039b77": {
+          "location": "ClientSideExtension.ApplicationCustomizer",
+          "properties": {
+            "apiUrl": "http://localhost:8000/chat",
+            "title": "Knowledge Hub Assistant"
+          }
+        }
+      }
+    }
+  }
+}

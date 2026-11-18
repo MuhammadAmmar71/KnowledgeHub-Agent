@@ -15,6 +15,7 @@ import httpx
 
 from app.auth.graph_auth import GraphAuth
 from app.config import Settings
+from app.observability import GRAPH_REQUESTS, GRAPH_RETRIES, GRAPH_THROTTLED
 
 logger = logging.getLogger("knowledge_agent.graph_client")
 
@@ -80,13 +81,45 @@ class GraphClient:
         token = await asyncio.to_thread(self._auth.get_access_token)
         return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
+    def _backoff_delay(self, attempt: int) -> float:
+        return min(
+            self._settings.http_backoff_base_seconds * (2 ** (attempt - 1)),
+            self._settings.http_max_backoff_seconds,
+        )
+
     async def _request_with_retry(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         attempt = 0
+        extra_headers = kwargs.pop("headers", {})
         while True:
             attempt += 1
-            async with self._semaphore:
-                headers = {**(await self._auth_headers()), **kwargs.pop("headers", {})}
-                response = await self._client.request(method, url, headers=headers, **kwargs)
+            try:
+                async with self._semaphore:
+                    headers = {**(await self._auth_headers()), **extra_headers}
+                    response = await self._client.request(method, url, headers=headers, **kwargs)
+            except httpx.TransportError as exc:
+                # Connection resets, DNS hiccups, timeouts (spec section 43:
+                # transient). The exception text can include the URL, which
+                # may be a pre-authenticated download URL -- log the type only.
+                if attempt > self._settings.http_max_retries:
+                    logger.warning(
+                        "graph_request_transport_retries_exhausted method=%s error=%s attempts=%d",
+                        method, type(exc).__name__, attempt,
+                    )
+                    raise GraphApiError(
+                        f"Graph request failed after {attempt} attempts: {type(exc).__name__}"
+                    ) from None
+                delay = self._backoff_delay(attempt)
+                GRAPH_RETRIES.labels(reason=type(exc).__name__).inc()
+                logger.info(
+                    "graph_request_retry method=%s error=%s attempt=%d delay_s=%.2f",
+                    method, type(exc).__name__, attempt, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            GRAPH_REQUESTS.labels(method=method, status=str(response.status_code)).inc()
+            if response.status_code == 429:
+                GRAPH_THROTTLED.inc()
 
             if response.status_code not in _RETRYABLE_STATUS_CODES:
                 return response
@@ -99,14 +132,16 @@ class GraphClient:
                 return response
 
             retry_after = response.headers.get("Retry-After")
+            delay = self._backoff_delay(attempt)
             if retry_after is not None:
                 try:
-                    delay = float(retry_after)
+                    # Honor the server's value (spec section 44), but never
+                    # sleep longer than the cap on a malformed/huge header.
+                    delay = min(max(float(retry_after), 0.0), self._settings.http_max_backoff_seconds)
                 except ValueError:
-                    delay = self._settings.http_backoff_base_seconds * (2 ** (attempt - 1))
-            else:
-                delay = self._settings.http_backoff_base_seconds * (2 ** (attempt - 1))
+                    pass
 
+            GRAPH_RETRIES.labels(reason=str(response.status_code)).inc()
             logger.info(
                 "graph_request_retry method=%s status=%s attempt=%d delay_s=%.2f",
                 method, response.status_code, attempt, delay,

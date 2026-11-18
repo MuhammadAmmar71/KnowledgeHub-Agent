@@ -30,7 +30,7 @@ from sqlalchemy import (
     func,
 )
 from pgvector.sqlalchemy import Vector
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -214,6 +214,13 @@ class Chunk(Base):
         TSVECTOR, Computed("to_tsvector('english', content)", persisted=True)
     )
 
+    # 8-digit project numbers found in this chunk's text or its document's
+    # name/path (app/project_numbers.py). Lets search restrict exactly to a
+    # project, which neither embeddings nor full-text search can do reliably.
+    project_numbers: Mapped[list[str]] = mapped_column(
+        ARRAY(String(8)), default=list, server_default="{}", nullable=False
+    )
+
     __table_args__ = (
         Index(
             "ix_chunks_embedding_hnsw", "embedding",
@@ -222,9 +229,44 @@ class Chunk(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
         Index("ix_chunks_content_tsv", "content_tsv", postgresql_using="gin"),
+        Index("ix_chunks_project_numbers", "project_numbers", postgresql_using="gin"),
     )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class Conversation(Base):
+    """
+    Phase 11: one chat conversation, owned by one Entra user (oid). Only
+    used to resolve follow-up questions -- answers are always grounded in
+    freshly retrieved SharePoint excerpts, never in earlier answers.
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(String(128), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(16))  # "user" | "assistant"
+    content: Mapped[str] = mapped_column(Text)
+    # For user turns: the follow-up rewritten as a standalone question (what
+    # retrieval actually searched for) -- kept for debugging answer quality.
+    standalone_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # For assistant turns: the sources returned with the answer.
+    sources: Mapped[list] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

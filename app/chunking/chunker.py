@@ -24,6 +24,8 @@ import re
 import uuid
 from dataclasses import dataclass, field
 
+from app.project_numbers import extract_project_numbers
+
 # Fixed, arbitrary namespace UUID -- only needs to be stable across runs,
 # never regenerate this value.
 _CHUNK_ID_NAMESPACE = uuid.UUID("6f1c1b2e-3b8a-4b8b-9c3a-8f0f6e6f1a11")
@@ -55,6 +57,8 @@ class Chunk:
     content: str
     token_count: int
     metadata: dict = field(default_factory=dict)
+    # 8-digit project numbers this chunk belongs to (see app/project_numbers.py).
+    project_numbers: list[str] = field(default_factory=list)
 
 
 def _section_metadata_from_match(match: re.Match) -> dict:
@@ -244,6 +248,10 @@ class Chunker:
         """
         base_metadata = base_metadata or {}
         sections = _split_into_sections(text)
+        # A project number in the document's name or folder path applies to
+        # every chunk of it, even chunks whose own text never mentions it
+        # (e.g. everything under "10000001---pulse-dashboard.../").
+        document_projects = extract_project_numbers(base_metadata.get("name"), base_metadata.get("path"))
 
         chunks: list[Chunk] = []
         index = 0
@@ -256,6 +264,10 @@ class Chunker:
                     content=piece,
                     token_count=_estimate_token_count(piece),
                     metadata=metadata,
+                    project_numbers=sorted(set(document_projects).union(
+                        # The heading is stripped from content but still describes it.
+                        extract_project_numbers(piece, section_meta.get("heading"))
+                    )),
                 ))
                 index += 1
 

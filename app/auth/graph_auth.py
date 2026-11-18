@@ -40,7 +40,7 @@ class GraphAuth:
         self._lock = threading.Lock()
         self._app = msal.ConfidentialClientApplication(
             client_id=settings.client_id,
-            client_credential=settings.client_secret,
+            client_credential=settings.client_secret.get_secret_value(),
             authority=settings.authority,
         )
 

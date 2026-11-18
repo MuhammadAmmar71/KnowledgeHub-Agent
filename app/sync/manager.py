@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 from app.chunking.chunker import Chunker
 from app.db.models import Document, ProcessingStatus, SourceType
+from app.observability import EXTRACTION_FAILURES
 from app.processing.router import ProcessorRouter, UnsupportedExtensionError
 from app.sharepoint.client import GraphApiError, GraphClient
 from app.sharepoint.delta import fetch_all_delta_changes, initial_delta_endpoint
@@ -120,6 +121,7 @@ async def _extract_and_chunk_file(
         return
     except Exception as exc:
         logger.exception("extraction_failed document_id=%s name=%s", document_id, document_name)
+        EXTRACTION_FAILURES.labels(extension=extension or "none").inc()
         try:
             await doc_repo.mark_processing_status(document_id, ProcessingStatus.extraction_failed, str(exc))
             await doc_repo.commit()
@@ -309,6 +311,8 @@ async def run_initial_sync(
     Runs discovery (unless a pre-computed DiscoveryResult is passed, mainly
     for testing) and processes every supported file found. Unsupported
     files are counted as skipped, never as failures (spec section 4).
+    Afterwards, tracked files absent from the listing are marked deleted,
+    which makes this same function the full reconciliation / rebuild path.
 
     This function does not create or finalize a SyncRun row itself -- the
     API layer owns that lifecycle (create -> run -> mark success/partial/
@@ -333,6 +337,27 @@ async def run_initial_sync(
             counters.items_failed += 1
             counters.errors.append(f"{discovered.name} ({discovered.item_id})")
         # unchanged -> no counter bump; it's neither new work nor a failure
+
+    # Reconciliation (spec sections 23/53): walk_drive raises rather than
+    # returning a partial listing, so reaching here means `result` is the
+    # complete current inventory. Any tracked file not in it -- deleted in
+    # SharePoint, a delete the delta feed never delivered, or renamed to an
+    # unsupported extension -- is stale; SharePoint wins (spec section 52).
+    # Files that failed to download above are still in the listing, so
+    # they're never mistaken for deletions.
+    seen_item_ids = {discovered.item_id for discovered in result.files}
+    try:
+        deleted_count = await repo.mark_missing_deleted(SourceType.file, seen_item_ids)
+        await repo.commit()
+    except Exception as exc:
+        logger.exception("failed_to_mark_missing_files_deleted")
+        await repo.rollback()
+        counters.items_failed += 1
+        counters.errors.append(f"stale-record cleanup failed: {exc}")
+    else:
+        counters.items_deleted += deleted_count
+        if deleted_count:
+            logger.info("reconciliation_marked_deleted count=%d", deleted_count)
 
     return counters
 
@@ -436,6 +461,7 @@ async def run_delta_sync(
         logger.error("delta_fetch_failed source=%s status=%s", source, exc.status_code)
         counters.items_failed += 1
         counters.errors.append(f"delta fetch failed: {exc}")
+        await sync_state_repo.record_failure(source)
         return counters
 
     counters.items_detected = len(fetch_result.items)
@@ -465,6 +491,7 @@ async def run_delta_sync(
         # defensively), leaving the old cursor in place is still correct.
         await sync_state_repo.record_success(source, fetch_result.delta_link)
     else:
+        await sync_state_repo.record_failure(source)
         logger.warning(
             "delta_cursor_not_advanced source=%s items_failed=%d -- next run will retry this batch",
             source, counters.items_failed,

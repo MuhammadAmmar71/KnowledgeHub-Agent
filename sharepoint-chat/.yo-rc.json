@@ -1,0 +1,23 @@
+{
+  "@microsoft/generator-sharepoint": {
+    "whichFolder": "subdir",
+    "solutionName": "knowledge-agent-sp-chat",
+    "environment": "spo",
+    "packageManager": "npm",
+    "skipFeatureDeployment": false,
+    "isDomainIsolated": false,
+    "useGulp": false,
+    "componentType": "extension",
+    "extensionType": "ApplicationCustomizer",
+    "componentName": "ChatBot",
+    "componentDescription": "Floating chatbot for the Auximo Knowledge Hub",
+    "plusBeta": false,
+    "isCreatingSolution": true,
+    "nodeVersion": "22.23.3",
+    "sdksVersions": {},
+    "version": "1.23.2",
+    "libraryName": "knowledge-agent-sp-chat",
+    "libraryId": "87658ade-0287-4a14-aa10-1385f15d4db8",
+    "solutionShortDescription": "Knowledge Hub Assistant chat bubble"
+  }
+}

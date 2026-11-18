@@ -33,7 +33,9 @@ from app.embeddings.sentence_transformer import SentenceTransformerProvider
 from app.llm.azure_openai import AzureOpenAIResponsesClient
 from app.llm.base import LLMError
 from app.rag.answer import RagAnswer, answer_question
-from app.retrieval.search import SearchFilters, SearchMode, SearchResult, search_chunks
+from app.retrieval.rerank import CrossEncoderReranker
+from app.project_numbers import is_project_number
+from app.retrieval.search import ProjectScope, SearchFilters, SearchMode, SearchResult, scoped_search
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -49,7 +51,32 @@ def _add_retrieval_args(parser: argparse.ArgumentParser, top_k_help: str) -> Non
         "--ext", action="append", default=[], metavar=".EXT", help="only these file extensions (repeatable)"
     )
     parser.add_argument("--path", help="only documents whose path contains this text")
+    parser.add_argument(
+        "--project", action="append", default=[], type=_project_number, metavar="NNNNNNNN",
+        help="only content tagged with this 8-digit project number (repeatable). Without it, a project "
+             "number in the question restricts the search automatically.",
+    )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument(
+        "--no-rerank", action="store_true", help="skip cross-encoder reranking (faster, less precise)"
+    )
+
+
+def _project_number(value: str) -> str:
+    value = value.strip()
+    if not is_project_number(value):
+        raise argparse.ArgumentTypeError(f"'{value}' is not an 8-digit project number")
+    return value
+
+
+def describe_scope(scope: ProjectScope | None) -> str | None:
+    if scope is None:
+        return None
+    numbers = ", ".join(scope.project_numbers)
+    if scope.fell_back:
+        return f"Note: no indexed content is tagged with project {numbers}; showing results from all content."
+    how = "as requested" if scope.explicit else "detected in your question"
+    return f"Restricted to project {numbers} ({how})."
 
 
 def _filters_from_args(args: argparse.Namespace) -> SearchFilters:
@@ -57,6 +84,7 @@ def _filters_from_args(args: argparse.Namespace) -> SearchFilters:
         source_type=SourceType(args.type) if args.type else None,
         extensions=[_normalize_extension(e) for e in args.ext],
         path_contains=args.path,
+        project_numbers=args.project,
     )
 
 
@@ -66,6 +94,17 @@ def _build_embedding_provider(settings) -> SentenceTransformerProvider:
         device=settings.embedding_device,
         batch_size=settings.embedding_batch_size,
         query_instruction=settings.embedding_query_instruction,
+        passage_prefix=settings.embedding_passage_prefix,
+    )
+
+
+def _build_reranker(settings, args: argparse.Namespace) -> CrossEncoderReranker | None:
+    if not settings.rerank_enabled or args.no_rerank:
+        return None
+    return CrossEncoderReranker(
+        settings.reranker_model_name,
+        device=settings.embedding_device,
+        batch_size=settings.reranker_batch_size,
     )
 
 
@@ -123,10 +162,14 @@ def format_results(results: list[SearchResult], full: bool = False) -> str:
     for rank, r in enumerate(results, start=1):
         title = r.name + (f" › {r.section}" if r.section else "")
         signals = []
+        if r.rerank_score is not None:
+            signals.append(f"relevance {r.rerank_score:.3f}")
         if r.similarity is not None:
             signals.append(f"similarity {r.similarity:.3f}")
         if r.keyword_rank is not None:
             signals.append(f"keyword #{r.keyword_rank}")
+        if r.project_numbers:
+            signals.append(f"project {', '.join(r.project_numbers)}")
         lines = [f"{rank}. {title}  [{r.source_type}; {', '.join(signals) or 'n/a'}]"]
         if r.path:
             lines.append(f"   path: {r.path}")
@@ -144,9 +187,11 @@ def results_to_json(results: list[SearchResult]) -> str:
             {
                 "rank": rank,
                 "score": r.score,
+                "rerank_score": r.rerank_score,
                 "similarity": r.similarity,
                 "semantic_rank": r.semantic_rank,
                 "keyword_rank": r.keyword_rank,
+                "project_numbers": r.project_numbers,
                 "name": r.name,
                 "section": r.section,
                 "source_type": r.source_type,
@@ -173,21 +218,32 @@ async def _run_search(args: argparse.Namespace) -> int:
         async with session_factory() as session:
             if not await _check_index_ready(session, provider.model_name):
                 return 1
-            results = await search_chunks(
+            found = await scoped_search(
                 session, provider, args.query,
                 top_k=args.top_k or settings.search_default_top_k,
                 mode=SearchMode(args.mode),
                 filters=_filters_from_args(args),
+                reranker=_build_reranker(settings, args),
+                rerank_candidates=settings.rerank_candidates,
+                # Plain search shows everything ranked; the relevance cut-off
+                # only guards what gets sent to the LLM (ask).
             )
     finally:
         await engine.dispose()
 
-    print(results_to_json(results) if args.json else format_results(results, full=args.full))
+    note = describe_scope(found.scope)
+    if args.json:
+        if note:
+            print(note, file=sys.stderr)  # keep stdout pure JSON
+        print(results_to_json(found.results))
+    else:
+        print("\n\n".join(part for part in (note, format_results(found.results, full=args.full)) if part))
     return 0
 
 
 def format_answer(result: RagAnswer, show_context: bool = False) -> str:
-    lines = [result.answer.strip()]
+    note = describe_scope(result.project_scope)
+    lines = ([note, ""] if note else []) + [result.answer.strip()]
     if result.incomplete_reason:
         lines.append(f"\n[answer was cut off: {result.incomplete_reason}]")
     if result.sources:
@@ -217,6 +273,14 @@ def answer_to_json(result: RagAnswer) -> str:
             "answer": result.answer,
             "incomplete_reason": result.incomplete_reason,
             "llm_called": result.llm_called,
+            "project_scope": (
+                {
+                    "project_numbers": result.project_scope.project_numbers,
+                    "explicit": result.project_scope.explicit,
+                    "fell_back": result.project_scope.fell_back,
+                }
+                if result.project_scope else None
+            ),
             "cited": result.cited_numbers,
             "sources": [
                 {
@@ -261,11 +325,15 @@ async def _run_ask(args: argparse.Namespace) -> int:
         async with session_factory() as session:
             if not await _check_index_ready(session, provider.model_name):
                 return 1
+            reranker = _build_reranker(settings, args)
             result = await answer_question(
                 session, provider, llm, args.question,
                 top_k=args.top_k or settings.rag_top_k,
                 mode=SearchMode(args.mode),
                 filters=_filters_from_args(args),
+                reranker=reranker,
+                rerank_candidates=settings.rerank_candidates,
+                min_relevance=settings.rerank_min_relevance if reranker is not None else None,
             )
     except LLMError as exc:
         print(f"error: {exc}", file=sys.stderr)

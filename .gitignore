@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .mypy_cache/
+backups/
+CLAUDE.md
+SHAREPOINT_AGENT_INTEGRATION.md

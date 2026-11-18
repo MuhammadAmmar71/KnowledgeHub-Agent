@@ -1,0 +1,51 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/spfx-build/package-solution.schema.json",
+  "solution": {
+    "name": "knowledge-agent-sp-chat-client-side-solution",
+    "id": "87658ade-0287-4a14-aa10-1385f15d4db8",
+    "version": "1.0.0.0",
+    "includeClientSideAssets": true,
+    "isDomainIsolated": false,
+    "developer": {
+      "name": "Auximo",
+      "websiteUrl": "",
+      "privacyUrl": "",
+      "termsOfUseUrl": "",
+      "mpnId": "Undefined-1.23.2"
+    },
+    "metadata": {
+      "shortDescription": {
+        "default": "Knowledge Hub Assistant"
+      },
+      "longDescription": {
+        "default": "Floating chat assistant for the Auximo Knowledge Hub. Answers questions from the hub's pages and documents, with links to the sources."
+      },
+      "screenshotPaths": [],
+      "videoUrl": "",
+      "categories": []
+    },
+    "features": [
+      {
+        "title": "Knowledge Hub Assistant",
+        "description": "Adds the chat bubble to the site's pages.",
+        "id": "2086c8b3-c527-43c0-923d-13815eac6784",
+        "version": "1.0.0.0",
+        "assets": {
+          "elementManifests": [
+            "elements.xml",
+            "ClientSideInstance.xml"
+          ]
+        }
+      }
+    ],
+    "webApiPermissionRequests": [
+      {
+        "resource": "__APP_REGISTRATION_DISPLAY_NAME__",
+        "scope": "user_impersonation"
+      }
+    ]
+  },
+  "paths": {
+    "zippedPackage": "solution/knowledge-agent-sp-chat.sppkg"
+  }
+}

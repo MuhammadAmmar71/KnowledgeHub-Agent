@@ -16,9 +16,21 @@ logger = logging.getLogger("knowledge_agent.embeddings.sentence_transformer")
 
 
 class SentenceTransformerProvider:
-    def __init__(self, model_name: str, device: str = "cpu", batch_size: int = 32, query_instruction: str = ""):
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "cpu",
+        batch_size: int = 32,
+        query_instruction: str = "",
+        passage_prefix: str = "",
+    ):
         self.model_name = model_name
+        # Retrieval models are trained with fixed markers: bge prefixes only
+        # queries ("Represent this sentence ..."), e5 prefixes both sides
+        # ("query: " / "passage: "). Getting these wrong silently degrades
+        # retrieval, so they're configured alongside the model name.
         self._query_instruction = query_instruction
+        self._passage_prefix = passage_prefix
         self._device = device
         self._batch_size = batch_size
         self._model = None
@@ -60,13 +72,17 @@ class SentenceTransformerProvider:
         )
         return vectors.tolist()
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        if not texts:
-            return []
+    async def _encode_off_loop(self, texts: list[str]) -> list[list[float]]:
         # CPU-bound inference -- run it off the event loop so API requests
         # stay responsive while a large batch is embedding (Rule 13).
         return await asyncio.to_thread(self._encode, texts)
 
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Document/chunk texts (passage side)."""
+        if not texts:
+            return []
+        return await self._encode_off_loop([f"{self._passage_prefix}{t}" for t in texts])
+
     async def embed_query(self, query: str) -> list[float]:
-        vectors = await self.embed([f"{self._query_instruction}{query}"])
+        vectors = await self._encode_off_loop([f"{self._query_instruction}{query}"])
         return vectors[0]

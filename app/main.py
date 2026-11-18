@@ -1,67 +1,72 @@
 """
-FastAPI entrypoint -- Phases 1-7: Graph auth/discovery, persistent state,
-initial/delta/page sync, extraction, chunking, and the embedding stage.
-Vector search and RAG (Phases 8-9) are not wired up yet.
+FastAPI entrypoint: Graph health checks, sync triggers and status, the
+embedding stage, operational status/metrics, and (opt-in) debug previews.
+
+Sync and embedding jobs run through app/jobs.py (JobRunner), shared with
+the daily scheduler (app/scheduler.py) that the lifespan starts.
+
+POST /chat (Phase 11) serves the SharePoint chat bubble: Entra ID user
+tokens (app/auth/entra.py), CORS for the SharePoint origin only, and the
+grounded RAG pipeline via app/chat/service.py. Models and the LLM client are
+created once in the lifespan, not per request.
 """
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException, Security
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, Response
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
+from app.auth.entra import ChatAuthError, ChatForbiddenError, ChatUser, EntraTokenValidator
 from app.auth.graph_auth import GraphAuth, GraphAuthError
+from app.chat.service import ChatService, ConversationNotFoundError
 from app.chunking.chunker import Chunker
 from app.config import get_settings
 from app.db.database import build_engine, build_session_factory
 from app.db.models import Chunk as ChunkModel
-from app.db.models import Document, SourceType, SyncRun, SyncRunStatus, SyncRunType
-from app.embeddings.indexer import embed_pending_documents
+from app.db.models import Document, SourceType, SyncRun
 from app.embeddings.sentence_transformer import SentenceTransformerProvider
+from app.jobs import JobRunner, LibrarySyncMode, StartedRun, SyncAlreadyRunningError
+from app.llm.azure_openai import AzureOpenAIResponsesClient
+from app.llm.base import LLMError
+from app.observability import (
+    CHAT_REQUESTS,
+    CHAT_SECONDS,
+    CHUNKS,
+    DOCUMENTS,
+    LAST_SUCCESSFUL_SYNC,
+    SYNC_RUNNING,
+    configure_logging,
+)
 from app.processing.router import UnsupportedExtensionError, build_default_router
+from app.retrieval.rerank import CrossEncoderReranker
+from app.scheduler import DailyScheduler
 from app.sharepoint.client import GraphApiError, GraphClient
 from app.sharepoint.drives import DiscoveredFile, check_drive_health, check_site_health, walk_drive
 from app.sharepoint.files import download_file
 from app.sharepoint.pages import check_page_capability, get_page_content, normalize_page_content
-from app.sync.manager import establish_delta_baseline, run_delta_sync, run_initial_sync, run_page_sync
-from app.sync.state import SqlAlchemyChunkRepository, SqlAlchemyDocumentRepository, SqlAlchemySyncStateRepository
+from app.status import collect_status
+from app.sync.locks import PostgresAdvisoryLockManager
+from app.sync.state import SqlAlchemyDocumentRepository
 
-DOCUMENT_LIBRARY_SOURCE = "document_library"
 # One shared router instance -- processors (notably ImageProcessor's
 # Tesseract path) have no per-request state worth recreating every call.
 _processing_router = build_default_router()
 # Same reasoning for the embedding provider, plus it's expensive: the model
 # is loaded once (lazily, on first embed) and reused for every run.
 _embedding_provider: SentenceTransformerProvider | None = None
-# One embedding run at a time -- an auto run after sync and a manual
-# POST /embeddings/run would otherwise select and embed the same documents.
-_embedding_lock = asyncio.Lock()
 
-logging.basicConfig(level=logging.INFO)
-# httpx logs every request URL at INFO. Following the /content redirect means
-# the target is a temporary download URL carrying auth material in its query
-# string, which must never be logged (spec section 50).
-logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("knowledge_agent.main")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    settings = get_settings()
-    engine = build_engine(settings)
-    app.state.session_factory = build_session_factory(engine)
-    try:
-        yield
-    finally:
-        await engine.dispose()
-
-
-app = FastAPI(title="Auximo Knowledge Agent", version="0.7.0-phase7", lifespan=lifespan)
 
 
 def _build_graph_client() -> GraphClient:
@@ -84,48 +89,226 @@ def _get_embedding_provider() -> SentenceTransformerProvider:
             device=settings.embedding_device,
             batch_size=settings.embedding_batch_size,
             query_instruction=settings.embedding_query_instruction,
+            passage_prefix=settings.embedding_passage_prefix,
         )
     return _embedding_provider
 
 
-async def _execute_embedding_run(reembed_all: bool = False) -> None:
-    """
-    Runs the embedding stage in its own session. Never raises: embedding
-    failures are tracked per document (EMBEDDING_FAILED) and retried by the
-    next run, so they never affect a sync run's status or its delta cursor.
-    """
-    async with _embedding_lock:
-        session_factory = app.state.session_factory
-        async with session_factory() as session:
-            try:
-                counters = await embed_pending_documents(
-                    doc_repo=SqlAlchemyDocumentRepository(session),
-                    chunk_repo=SqlAlchemyChunkRepository(session),
-                    provider=_get_embedding_provider(),
-                    batch_size=get_settings().embedding_batch_size,
-                    reembed_all=reembed_all,
-                )
-                logger.info(
-                    "embedding_stage_completed indexed=%d failed=%d chunks=%d",
-                    counters.documents_indexed, counters.documents_failed, counters.chunks_embedded,
-                )
-            except Exception:  # noqa: BLE001 -- background job; log, don't crash the worker
-                logger.exception("embedding_stage_crashed")
-                await session.rollback()
+def _build_reranker(settings) -> CrossEncoderReranker | None:
+    if not settings.rerank_enabled:
+        return None
+    return CrossEncoderReranker(
+        settings.reranker_model_name, device=settings.embedding_device, batch_size=settings.reranker_batch_size
+    )
 
 
-async def _embed_after_sync() -> None:
-    if get_settings().embed_after_sync:
-        await _execute_embedding_run()
+def _build_llm_client(settings) -> AzureOpenAIResponsesClient | None:
+    if settings.azure_openai_api_key is None:
+        return None
+    return AzureOpenAIResponsesClient(
+        endpoint=settings.azure_openai_endpoint,
+        api_key=settings.azure_openai_api_key.get_secret_value(),
+        deployment=settings.azure_openai_deployment,
+        temperature=settings.llm_temperature,
+        max_output_tokens=settings.llm_max_output_tokens,
+        timeout_seconds=settings.llm_timeout_seconds,
+        max_retries=settings.llm_max_retries,
+    )
+
+
+async def _warm_models(embedding_provider, reranker) -> None:
+    # Loading torch + the models takes seconds; do it now, in the
+    # background, so the first chat request doesn't pay for it. /health
+    # stays responsive meanwhile.
+    started = time.perf_counter()
+    try:
+        await embedding_provider.embed_query("warm up")
+        if reranker is not None:
+            await reranker.score("warm up", ["warm up"])
+        logger.info("chat_models_warmed seconds=%.1f", time.perf_counter() - started)
+    except Exception:  # noqa: BLE001 -- warm-up is an optimisation; requests load lazily anyway
+        logger.exception("chat_model_warmup_failed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    configure_logging(settings.log_level, settings.log_format)
+    if settings.api_key is None:
+        logger.warning("api_key_not_configured -- every endpoint is unauthenticated; set API_KEY in production")
+
+    engine = build_engine(settings)
+    app.state.session_factory = build_session_factory(engine)
+    app.state.runner = JobRunner(
+        settings=settings,
+        session_factory=app.state.session_factory,
+        locks=PostgresAdvisoryLockManager(engine),
+        graph_client_factory=_build_graph_client,
+        router=_processing_router,
+        embedding_provider_factory=_get_embedding_provider,
+    )
+    await app.state.runner.recover_interrupted_runs()
+
+    llm_client = _build_llm_client(settings)
+    reranker = _build_reranker(settings)
+    warmup: asyncio.Task | None = None
+    if llm_client is None:
+        app.state.chat_service = None
+        logger.warning("chat_disabled -- AZURE_OPENAI_API_KEY is not set; POST /chat returns 503")
+    else:
+        app.state.chat_service = ChatService(
+            settings=settings,
+            session_factory=app.state.session_factory,
+            embedding_provider=_get_embedding_provider(),
+            reranker=reranker,
+            llm=llm_client,
+        )
+        if settings.chat_warmup_models:
+            warmup = asyncio.create_task(_warm_models(_get_embedding_provider(), reranker))
+    if settings.chat_audiences:
+        app.state.chat_token_validator = EntraTokenValidator(
+            settings.tenant_id, settings.chat_audiences, settings.chat_required_scope,
+            required_role=settings.chat_required_role,
+        )
+    else:
+        logger.warning("chat_auth_audience_not_set -- POST /chat uses API_KEY auth with a shared identity (dev mode)")
+
+    scheduler: DailyScheduler | None = None
+    if settings.sync_schedule_enabled:
+        scheduler = DailyScheduler(app.state.runner, settings.sync_schedule_time, settings.sync_schedule_timezone)
+        scheduler.start()
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            await scheduler.stop()
+        if warmup is not None and not warmup.done():
+            warmup.cancel()
+        if llm_client is not None:
+            await llm_client.aclose()
+        await engine.dispose()
+
+
+app = FastAPI(title="Auximo Knowledge Agent", version="1.1.0", lifespan=lifespan)
+
+
+class _SettingsCORSMiddleware:
+    """
+    CORSMiddleware configured from settings on first request rather than at
+    import time (settings load lazily; tests swap them). Exact origins only
+    (validated in Settings); no cookies are involved -- the chat bubble
+    sends an Authorization header -- so credentials stay disabled.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._cors: CORSMiddleware | None = None
+
+    async def __call__(self, scope, receive, send):
+        if self._cors is None:
+            self._cors = CORSMiddleware(
+                self.app,
+                allow_origins=get_settings().cors_origins,
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+                allow_credentials=False,
+                # Lets the SharePoint page reach a backend on localhost during
+                # SPFx development (Chrome Private Network Access).
+                allow_private_network=True,
+                max_age=600,
+            )
+        await self._cors(scope, receive, send)
+
+
+app.add_middleware(_SettingsCORSMiddleware)
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+_bearer = HTTPBearer(auto_error=False)
+
+
+async def require_api_key(
+    api_key: str | None = Security(_api_key_header),
+    bearer: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> None:
+    """
+    Accepts the key as "X-API-Key: <key>" or "Authorization: Bearer <key>"
+    (the latter is what Prometheus' scrape config can send). No-op when
+    API_KEY isn't configured.
+    """
+    expected = get_settings().api_key
+    if expected is None:
+        return
+    supplied = api_key or (bearer.credentials if bearer else None)
+    if supplied is None or not hmac.compare_digest(
+        supplied.encode("utf-8"), expected.get_secret_value().encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="missing or invalid API key")
+
+
+async def require_debug_enabled() -> None:
+    # 404 rather than 403: when disabled, these endpoints simply don't exist.
+    if not get_settings().enable_debug_endpoints:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _chat_token_validator() -> EntraTokenValidator:
+    validator = getattr(app.state, "chat_token_validator", None)
+    if validator is None:
+        settings = get_settings()
+        validator = EntraTokenValidator(
+            settings.tenant_id, settings.chat_audiences, settings.chat_required_scope,
+            required_role=settings.chat_required_role,
+        )
+        app.state.chat_token_validator = validator
+    return validator
+
+
+async def require_chat_user(
+    api_key: str | None = Security(_api_key_header),
+    bearer: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> ChatUser:
+    """
+    Production (CHAT_AUTH_AUDIENCE set): a valid Entra ID user token is
+    required, and the user's identity comes from it; with CHAT_REQUIRED_ROLE
+    set, the user must also hold that app role (else 403). Development (unset):
+    falls back to API_KEY, with one shared identity for every caller.
+    """
+    if get_settings().chat_audiences:
+        if bearer is None:
+            raise HTTPException(status_code=401, detail="missing bearer token", headers={"WWW-Authenticate": "Bearer"})
+        try:
+            return await _chat_token_validator().validate(bearer.credentials)
+        except ChatAuthError as exc:
+            # The reason is useful to operators, useless (or helpful) to attackers.
+            logger.warning("chat_token_rejected reason=%s", exc)
+            raise HTTPException(
+                status_code=401, detail="invalid or expired token", headers={"WWW-Authenticate": "Bearer"}
+            ) from exc
+        except ChatForbiddenError as exc:
+            # oid is a pseudonymous id -- enough for an admin to look the user up.
+            logger.warning("chat_access_denied reason=%s", exc)
+            raise HTTPException(status_code=403, detail="you do not have access to the Knowledge Hub Assistant") from exc
+    await require_api_key(api_key, bearer)
+    return ChatUser(user_id="local-dev", name="Local development")
+
+
+protected = APIRouter(dependencies=[Depends(require_api_key)])
+# /chat authenticates users itself (Entra tokens), so it isn't on `protected`.
+chat_router = APIRouter()
+debug_router = APIRouter(dependencies=[Depends(require_api_key), Depends(require_debug_enabled)])
+
+
+def _runner() -> JobRunner:
+    return app.state.runner
 
 
 @app.get("/health")
 async def health() -> dict:
-    """Liveness check -- does not touch Graph or the network."""
-    return {"status": "ok", "phase": "1"}
+    """Liveness check -- unauthenticated; does not touch Graph or the network."""
+    return {"status": "ok"}
 
 
-@app.get("/health/graph")
+@protected.get("/health/graph")
 async def health_graph() -> dict:
     """
     Confirms: app-only auth succeeds, the configured site is reachable,
@@ -149,7 +332,7 @@ async def health_graph() -> dict:
         await client.aclose()
 
 
-@app.get("/discovery/preview")
+@debug_router.get("/discovery/preview")
 async def discovery_preview() -> dict:
     """
     Manual development endpoint (spec section 69): runs a full recursive
@@ -177,7 +360,7 @@ async def discovery_preview() -> dict:
         await client.aclose()
 
 
-@app.get("/health/pages")
+@protected.get("/health/pages")
 async def health_pages() -> dict:
     """
     Capability test ONLY (spec section 7) -- confirms whether the app's
@@ -201,7 +384,7 @@ async def health_pages() -> dict:
         await client.aclose()
 
 
-@app.get("/debug/pages/{page_id}/preview", response_class=PlainTextResponse)
+@debug_router.get("/debug/pages/{page_id}/preview", response_class=PlainTextResponse)
 async def preview_page_content(page_id: str) -> str:
     """
     Read-only, no database writes: fetches ONE page live from Graph and
@@ -232,7 +415,7 @@ async def preview_page_content(page_id: str) -> str:
         await client.aclose()
 
 
-@app.get("/debug/files/{item_id}/preview", response_class=PlainTextResponse)
+@debug_router.get("/debug/files/{item_id}/preview", response_class=PlainTextResponse)
 async def preview_file_content(item_id: str) -> str:
     """
     Read-only, no database writes: downloads ONE tracked file live from
@@ -320,7 +503,7 @@ def _serialize_chunks_preview(chunks: list, warnings: list[str]) -> dict:
     }
 
 
-@app.get("/debug/files/{item_id}/chunks")
+@debug_router.get("/debug/files/{item_id}/chunks")
 async def preview_file_chunks(item_id: str) -> dict:
     """
     Read-only, no database writes: downloads + extracts a tracked file
@@ -386,7 +569,7 @@ async def preview_file_chunks(item_id: str) -> dict:
     return _serialize_chunks_preview(chunks, extracted.warnings)
 
 
-@app.get("/debug/pages/{page_id}/chunks")
+@debug_router.get("/debug/pages/{page_id}/chunks")
 async def preview_page_chunks(page_id: str) -> dict:
     """Same purpose as preview_file_chunks, for a tracked SharePoint page."""
     settings = get_settings()
@@ -430,214 +613,20 @@ async def preview_page_chunks(page_id: str) -> dict:
     return _serialize_chunks_preview(chunks, [])
 
 
-async def _execute_initial_sync(sync_run_id: uuid.UUID) -> None:
-    """
-    Background job for POST /sync. Owns the full sync_run lifecycle:
-    running -> success/partial/failed. Per spec section 41, the HTTP
-    request that triggers this must not wait for it to finish.
-    """
-    settings = get_settings()
-    client = _build_graph_client()
-    session_factory = app.state.session_factory
-
-    async with session_factory() as session:
-        try:
-            repo = SqlAlchemyDocumentRepository(session)
-            chunk_repo = SqlAlchemyChunkRepository(session)
-            chunker = _build_chunker()
-            counters = await run_initial_sync(
-                client=client,
-                drive_id=settings.sharepoint_drive_id,
-                site_id=settings.sharepoint_site_id,
-                repo=repo,
-                router=_processing_router,
-                chunker=chunker,
-                chunk_repo=chunk_repo,
-            )
-
-            # Establish a delta cursor now so the NEXT POST /sync can take
-            # the cheap incremental path instead of repeating this full
-            # walk. A failure here doesn't fail the sync_run itself -- the
-            # initial sync already succeeded; worst case, the next run just
-            # falls back to another full walk (safe, just not ideal).
-            sync_state_repo = SqlAlchemySyncStateRepository(session)
-            try:
-                await establish_delta_baseline(client, settings.sharepoint_drive_id, sync_state_repo)
-            except Exception:
-                logger.exception("delta_baseline_establishment_failed sync_id=%s", sync_run_id)
-
-            sync_run = await session.get(SyncRun, sync_run_id)
-            sync_run.items_detected = counters.items_detected
-            sync_run.items_added = counters.items_added
-            sync_run.items_modified = counters.items_modified
-            sync_run.items_deleted = counters.items_deleted
-            sync_run.items_skipped = counters.items_skipped
-            sync_run.items_failed = counters.items_failed
-            sync_run.error_count = len(counters.errors)
-            sync_run.error_summary = "; ".join(counters.errors[:20]) or None
-            sync_run.status = (
-                SyncRunStatus.success if not counters.has_failures else SyncRunStatus.partial
-            )
-            sync_run.completed_at = datetime.now(timezone.utc)
-            await session.commit()
-            logger.info(
-                "sync_run_completed sync_id=%s status=%s added=%d modified=%d failed=%d skipped=%d",
-                sync_run_id, sync_run.status, counters.items_added,
-                counters.items_modified, counters.items_failed, counters.items_skipped,
-            )
-        except Exception as exc:  # noqa: BLE001 -- last-resort guard so a run always gets finalized
-            logger.exception("sync_run_crashed sync_id=%s", sync_run_id)
-            # The exception may have left the session's transaction aborted
-            # (e.g. a Postgres error mid-flush) -- roll back before trying
-            # to use the same session again, or this recovery path throws
-            # its own PendingRollbackError on top of the original failure.
-            await session.rollback()
-            sync_run = await session.get(SyncRun, sync_run_id)
-            if sync_run is not None:
-                sync_run.status = SyncRunStatus.failed
-                sync_run.error_summary = f"{type(exc).__name__}: {exc}"[:2000]
-                sync_run.completed_at = datetime.now(timezone.utc)
-                await session.commit()
-        finally:
-            await client.aclose()
-
-    await _embed_after_sync()
+def _started_response(run: StartedRun) -> dict:
+    return {"sync_id": str(run.sync_id), "status": "started", "sync_type": run.sync_type.value}
 
 
-async def _execute_delta_sync(sync_run_id: uuid.UUID) -> None:
-    """
-    Background job for the incremental path. Same lifecycle contract as
-    _execute_initial_sync: always finalizes the sync_run row, rolls back
-    before reusing a session that may have been left in an aborted
-    transaction state, and never lets an unexpected exception escape
-    silently.
-    """
-    settings = get_settings()
-    client = _build_graph_client()
-    session_factory = app.state.session_factory
-
-    async with session_factory() as session:
-        try:
-            doc_repo = SqlAlchemyDocumentRepository(session)
-            sync_state_repo = SqlAlchemySyncStateRepository(session)
-            chunk_repo = SqlAlchemyChunkRepository(session)
-            chunker = _build_chunker()
-            counters = await run_delta_sync(
-                client=client,
-                drive_id=settings.sharepoint_drive_id,
-                site_id=settings.sharepoint_site_id,
-                doc_repo=doc_repo,
-                sync_state_repo=sync_state_repo,
-                source=DOCUMENT_LIBRARY_SOURCE,
-                router=_processing_router,
-                chunker=chunker,
-                chunk_repo=chunk_repo,
-            )
-
-            sync_run = await session.get(SyncRun, sync_run_id)
-            sync_run.items_detected = counters.items_detected
-            sync_run.items_added = counters.items_added
-            sync_run.items_modified = counters.items_modified
-            sync_run.items_deleted = counters.items_deleted
-            sync_run.items_skipped = counters.items_skipped
-            sync_run.items_failed = counters.items_failed
-            sync_run.error_count = len(counters.errors)
-            sync_run.error_summary = "; ".join(counters.errors[:20]) or None
-            sync_run.status = (
-                SyncRunStatus.success if not counters.has_failures else SyncRunStatus.partial
-            )
-            sync_run.completed_at = datetime.now(timezone.utc)
-            await session.commit()
-            logger.info(
-                "delta_sync_run_completed sync_id=%s status=%s added=%d modified=%d deleted=%d failed=%d skipped=%d",
-                sync_run_id, sync_run.status, counters.items_added, counters.items_modified,
-                counters.items_deleted, counters.items_failed, counters.items_skipped,
-            )
-        except Exception as exc:  # noqa: BLE001 -- last-resort guard so a run always gets finalized
-            logger.exception("delta_sync_run_crashed sync_id=%s", sync_run_id)
-            await session.rollback()
-            sync_run = await session.get(SyncRun, sync_run_id)
-            if sync_run is not None:
-                sync_run.status = SyncRunStatus.failed
-                sync_run.error_summary = f"{type(exc).__name__}: {exc}"[:2000]
-                sync_run.completed_at = datetime.now(timezone.utc)
-                await session.commit()
-        finally:
-            await client.aclose()
-
-    await _embed_after_sync()
+async def _start_library_sync(background_tasks: BackgroundTasks, mode: LibrarySyncMode) -> dict:
+    try:
+        run = await _runner().create_library_run(mode)
+    except SyncAlreadyRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    background_tasks.add_task(_runner().execute_library_sync, run)
+    return _started_response(run)
 
 
-async def _execute_page_sync(sync_run_id: uuid.UUID) -> None:
-    """
-    Background job for POST /sync/pages. Runs the capability check first
-    and stops cleanly (marks the run failed with a clear reason, does not
-    proceed) if permissions aren't sufficient -- never attempts page
-    listing on a permission it hasn't confirmed works (spec section 7,
-    Rule 6: do not auto-escalate).
-    """
-    settings = get_settings()
-    client = _build_graph_client()
-    session_factory = app.state.session_factory
-
-    async with session_factory() as session:
-        try:
-            capability = await check_page_capability(client, settings.sharepoint_site_id)
-            if not capability.available:
-                sync_run = await session.get(SyncRun, sync_run_id)
-                if sync_run is not None:
-                    sync_run.status = SyncRunStatus.failed
-                    sync_run.error_summary = capability.detail
-                    sync_run.completed_at = datetime.now(timezone.utc)
-                    await session.commit()
-                logger.error(
-                    "page_sync_blocked_by_permissions sync_id=%s http_status=%s",
-                    sync_run_id, capability.http_status,
-                )
-                return
-
-            doc_repo = SqlAlchemyDocumentRepository(session)
-            chunk_repo = SqlAlchemyChunkRepository(session)
-            chunker = _build_chunker()
-            counters = await run_page_sync(
-                client, settings.sharepoint_site_id, doc_repo, chunker=chunker, chunk_repo=chunk_repo
-            )
-
-            sync_run = await session.get(SyncRun, sync_run_id)
-            sync_run.items_detected = counters.items_detected
-            sync_run.items_added = counters.items_added
-            sync_run.items_modified = counters.items_modified
-            sync_run.items_deleted = counters.items_deleted
-            sync_run.items_skipped = counters.items_skipped
-            sync_run.items_failed = counters.items_failed
-            sync_run.error_count = len(counters.errors)
-            sync_run.error_summary = "; ".join(counters.errors[:20]) or None
-            sync_run.status = (
-                SyncRunStatus.success if not counters.has_failures else SyncRunStatus.partial
-            )
-            sync_run.completed_at = datetime.now(timezone.utc)
-            await session.commit()
-            logger.info(
-                "page_sync_run_completed sync_id=%s status=%s added=%d modified=%d deleted=%d failed=%d",
-                sync_run_id, sync_run.status, counters.items_added,
-                counters.items_modified, counters.items_deleted, counters.items_failed,
-            )
-        except Exception as exc:  # noqa: BLE001 -- last-resort guard so a run always gets finalized
-            logger.exception("page_sync_run_crashed sync_id=%s", sync_run_id)
-            await session.rollback()
-            sync_run = await session.get(SyncRun, sync_run_id)
-            if sync_run is not None:
-                sync_run.status = SyncRunStatus.failed
-                sync_run.error_summary = f"{type(exc).__name__}: {exc}"[:2000]
-                sync_run.completed_at = datetime.now(timezone.utc)
-                await session.commit()
-        finally:
-            await client.aclose()
-
-    await _embed_after_sync()
-
-
-@app.post("/sync/pages")
+@protected.post("/sync/pages")
 async def trigger_page_sync(background_tasks: BackgroundTasks) -> dict:
     """
     Deliberately a separate endpoint from POST /sync (spec section 7):
@@ -646,56 +635,45 @@ async def trigger_page_sync(background_tasks: BackgroundTasks) -> dict:
     GET /health/pages first if you just want to check capability without
     triggering a run.
     """
-    session_factory = app.state.session_factory
-    async with session_factory() as session:
-        sync_run = SyncRun(id=uuid.uuid4(), sync_type=SyncRunType.pages, status=SyncRunStatus.running)
-        session.add(sync_run)
-        await session.commit()
-        sync_id = sync_run.id
-
-    background_tasks.add_task(_execute_page_sync, sync_id)
-    return {"sync_id": str(sync_id), "status": "started", "sync_type": "pages"}
+    try:
+        run = await _runner().create_page_run()
+    except SyncAlreadyRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    background_tasks.add_task(_runner().execute_page_sync, run)
+    return _started_response(run)
 
 
-@app.post("/sync")
+@protected.post("/sync/reconcile")
+async def trigger_reconciliation(background_tasks: BackgroundTasks) -> dict:
+    """
+    Full reconciliation (spec sections 23/59): walk the whole drive, repair
+    anything delta missed, mark tracked files SharePoint no longer has as
+    deleted, and re-establish the delta cursor. Same as POST /sync?mode=full.
+    """
+    return await _start_library_sync(background_tasks, LibrarySyncMode.reconcile)
+
+
+@protected.post("/sync")
 async def trigger_sync(background_tasks: BackgroundTasks, mode: str = "auto") -> dict:
     """
     Creates a sync_run row immediately and returns sync_id without waiting
-    for the sync to finish (spec section 40/41).
+    for the sync to finish (spec section 40/41). 409 if a document-library
+    sync is already running (spec section 58).
 
     mode=auto (default), per spec section 64's daily-sync diagram: if no
-    delta cursor exists yet, run the full recursive walk (Phase 2) and
-    establish a cursor at the end; once a cursor exists, take the cheap
-    incremental delta path (Phase 3).
+    delta cursor exists yet, run the full recursive walk and establish a
+    cursor at the end; once a cursor exists, take the incremental delta path.
 
-    mode=full (spec section 53): always run the full walk and re-establish
-    the cursor, regardless of existing state. Rebuild/repair path -- safe to
-    run any time, since unchanged content is detected by hash and skipped.
+    mode=full (spec section 53): always run the full walk (a reconciliation)
+    and re-establish the cursor. Rebuild/repair path -- safe to run any time,
+    since unchanged content is detected by hash and skipped.
     """
     if mode not in ("auto", "full"):
         raise HTTPException(status_code=400, detail="mode must be 'auto' or 'full'")
-
-    session_factory = app.state.session_factory
-    async with session_factory() as session:
-        sync_state_repo = SqlAlchemySyncStateRepository(session)
-        existing_delta_link = await sync_state_repo.get_delta_link(DOCUMENT_LIBRARY_SOURCE)
-        run_full = mode == "full" or existing_delta_link is None
-        sync_type = SyncRunType.initial if run_full else SyncRunType.delta
-
-        sync_run = SyncRun(id=uuid.uuid4(), sync_type=sync_type, status=SyncRunStatus.running)
-        session.add(sync_run)
-        await session.commit()
-        sync_id = sync_run.id
-
-    if sync_type == SyncRunType.initial:
-        background_tasks.add_task(_execute_initial_sync, sync_id)
-    else:
-        background_tasks.add_task(_execute_delta_sync, sync_id)
-
-    return {"sync_id": str(sync_id), "status": "started", "sync_type": sync_type.value}
+    return await _start_library_sync(background_tasks, LibrarySyncMode(mode))
 
 
-@app.get("/sync/latest")
+@protected.get("/sync/latest")
 async def get_latest_sync() -> dict:
     session_factory = app.state.session_factory
     async with session_factory() as session:
@@ -707,7 +685,7 @@ async def get_latest_sync() -> dict:
         return _serialize_sync_run(sync_run)
 
 
-@app.get("/sync/{sync_id}")
+@protected.get("/sync/{sync_id}")
 async def get_sync_status(sync_id: uuid.UUID) -> dict:
     session_factory = app.state.session_factory
     async with session_factory() as session:
@@ -717,7 +695,7 @@ async def get_sync_status(sync_id: uuid.UUID) -> dict:
         return _serialize_sync_run(sync_run)
 
 
-@app.post("/embeddings/run")
+@protected.post("/embeddings/run")
 async def trigger_embedding_run(background_tasks: BackgroundTasks, reembed: str = "pending") -> dict:
     """
     reembed=pending (default): embed everything CHUNKED / EMBEDDING_FAILED /
@@ -726,11 +704,11 @@ async def trigger_embedding_run(background_tasks: BackgroundTasks, reembed: str 
     """
     if reembed not in ("pending", "all"):
         raise HTTPException(status_code=400, detail="reembed must be 'pending' or 'all'")
-    background_tasks.add_task(_execute_embedding_run, reembed == "all")
+    background_tasks.add_task(_runner().run_embedding, reembed == "all")
     return {"status": "started", "reembed": reembed}
 
 
-@app.get("/embeddings/status")
+@protected.get("/embeddings/status")
 async def get_embedding_status() -> dict:
     session_factory = app.state.session_factory
     async with session_factory() as session:
@@ -751,8 +729,58 @@ async def get_embedding_status() -> dict:
         }
 
 
-@app.get("/documents")
+@protected.get("/status")
+async def get_status() -> dict:
+    """Operational overview (spec section 47): syncs, counts, failures, last error."""
+    async with app.state.session_factory() as session:
+        status = await collect_status(session)
+    return {
+        "last_successful_sync": {
+            source: at.isoformat() if at else None for source, at in status.last_successful_sync.items()
+        },
+        "running_syncs": status.running_syncs,
+        "delta_cursor_state": status.delta_cursor_state,
+        "documents": {
+            "by_status": status.documents_by_status,
+            "total": sum(status.documents_by_status.values()),
+            "deleted": status.documents_deleted,
+        },
+        "chunks": {"total": status.chunks_total, "embedded": status.chunks_embedded},
+        "failed_documents": {"total": status.failed_documents_total, "recent": status.failed_documents},
+        "last_error": status.last_error,
+        "scheduler": {
+            "enabled": get_settings().sync_schedule_enabled,
+            "time": get_settings().sync_schedule_time,
+            "timezone": get_settings().sync_schedule_timezone or "server local",
+        },
+    }
+
+
+@protected.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus exposition. Database-backed gauges are refreshed on every scrape."""
+    async with app.state.session_factory() as session:
+        status = await collect_status(session, failed_limit=0)
+    DOCUMENTS.clear()
+    for doc_status, count in status.documents_by_status.items():
+        DOCUMENTS.labels(status=doc_status).set(count)
+    CHUNKS.labels(embedded="true").set(status.chunks_embedded)
+    CHUNKS.labels(embedded="false").set(status.chunks_total - status.chunks_embedded)
+    for source, at in status.last_successful_sync.items():
+        if at is not None:
+            LAST_SUCCESSFUL_SYNC.labels(source=source).set(at.timestamp())
+    SYNC_RUNNING.clear()
+    library_types = {"initial", "delta", "reconciliation", "manual"}
+    running = [r["sync_type"] for r in status.running_syncs]
+    SYNC_RUNNING.labels(source="document_library").set(sum(t in library_types for t in running))
+    SYNC_RUNNING.labels(source="site_pages").set(sum(t == "pages" for t in running))
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@protected.get("/documents")
 async def list_documents(limit: int = 50, offset: int = 0) -> dict:
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
     session_factory = app.state.session_factory
     async with session_factory() as session:
         stmt = select(Document).order_by(Document.updated_db_at.desc()).limit(limit).offset(offset)
@@ -761,7 +789,7 @@ async def list_documents(limit: int = 50, offset: int = 0) -> dict:
         return {"documents": [_serialize_document(d) for d in documents], "limit": limit, "offset": offset}
 
 
-@app.get("/documents/{document_id}")
+@protected.get("/documents/{document_id}")
 async def get_document(document_id: uuid.UUID) -> dict:
     session_factory = app.state.session_factory
     async with session_factory() as session:
@@ -804,3 +832,80 @@ def _serialize_document(document: Document) -> dict:
         "is_deleted": document.is_deleted,
         "last_synced_at": document.last_synced_at.isoformat() if document.last_synced_at else None,
     }
+
+
+class ChatRequest(BaseModel):
+    # SHAREPOINT_AGENT_INTEGRATION.md section 4. "user" and "page_url" are
+    # accepted for compatibility with the reference UI but never trusted:
+    # identity comes from the token.
+    model_config = ConfigDict(extra="ignore")
+
+    message: str = Field(min_length=1)
+    conversation_id: uuid.UUID | None = None
+    user: str | None = None
+    page_url: str | None = None
+
+
+class ChatSourceOut(BaseModel):
+    number: int
+    title: str
+    url: str | None
+    sections: list[str]
+    source_type: str
+    cited: bool
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    conversation_id: uuid.UUID
+    sources: list[ChatSourceOut]
+    # Set when the question named an 8-digit project number.
+    project_numbers: list[str] = []
+    project_scope_fell_back: bool = False
+
+
+@chat_router.post("/chat", response_model=ChatResponse)
+async def chat(body: ChatRequest, user: ChatUser = Depends(require_chat_user)) -> ChatResponse:
+    settings = get_settings()
+    message = body.message.strip()
+    if not message:
+        CHAT_REQUESTS.labels(outcome="invalid").inc()
+        raise HTTPException(status_code=422, detail="message must not be empty")
+    if len(message) > settings.chat_max_message_chars:
+        CHAT_REQUESTS.labels(outcome="invalid").inc()
+        raise HTTPException(
+            status_code=422, detail=f"message is longer than {settings.chat_max_message_chars} characters"
+        )
+
+    service: ChatService | None = getattr(app.state, "chat_service", None)
+    if service is None:
+        CHAT_REQUESTS.labels(outcome="unavailable").inc()
+        raise HTTPException(status_code=503, detail="chat is not configured on this server")
+
+    started = time.perf_counter()
+    try:
+        reply = await service.handle(user, message, body.conversation_id)
+    except ConversationNotFoundError as exc:
+        CHAT_REQUESTS.labels(outcome="conversation_not_found").inc()
+        raise HTTPException(status_code=404, detail="conversation not found") from exc
+    except LLMError as exc:
+        CHAT_REQUESTS.labels(outcome="llm_error").inc()
+        logger.error("chat_llm_failed status=%s", exc.status_code)
+        raise HTTPException(status_code=502, detail="the language model is unavailable, please try again") from exc
+
+    CHAT_REQUESTS.labels(outcome="answered" if reply.llm_called else "no_context").inc()
+    CHAT_SECONDS.observe(time.perf_counter() - started)
+    return ChatResponse(
+        reply=reply.reply,
+        conversation_id=reply.conversation_id,
+        sources=[ChatSourceOut(**s) for s in reply.sources],
+        project_numbers=reply.project_numbers,
+        project_scope_fell_back=reply.project_scope_fell_back,
+    )
+
+
+# Registered last: routes match in declaration order, and including a
+# router appends its routes to the app in their own declaration order.
+app.include_router(protected)
+app.include_router(chat_router)
+app.include_router(debug_router)

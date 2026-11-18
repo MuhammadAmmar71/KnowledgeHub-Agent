@@ -12,7 +12,7 @@ from app.rag.answer import (
     extract_citations,
     group_sources,
 )
-from app.retrieval.search import SearchResult
+from app.retrieval.search import ScopedSearch, SearchResult
 from tests.conftest import FakeEmbeddingProvider
 
 DOC_A, DOC_B = uuid.uuid4(), uuid.uuid4()
@@ -36,8 +36,8 @@ class FakeLLM:
 
 
 def _search_returning(results):
-    async def search(session, provider, query, top_k, mode, filters):
-        return results
+    async def search(session, provider, query, top_k, mode, filters, **rerank_options):
+        return ScopedSearch(results)
     return search
 
 
@@ -68,6 +68,7 @@ def test_system_prompt_covers_spec_38_rules():
     for phrase in (
         "only from the provided excerpts", "do not invent", "cite", "missing", "authoritative",
         "directly supported by an excerpt", "do not add your own characterisations",
+        "do not infer relationships or conditions",
     ):
         assert phrase in lowered
 

@@ -319,6 +319,10 @@ class SyncStateRepository(Protocol):
 
     async def record_success(self, source: str, delta_link: str | None) -> None: ...
 
+    async def record_failure(self, source: str) -> None:
+        """Marks the source's last attempt failed. Never touches the cursor."""
+        ...
+
 
 class SqlAlchemySyncStateRepository:
     def __init__(self, session: AsyncSession):
@@ -354,21 +358,35 @@ class SqlAlchemySyncStateRepository:
             row.status = "ok"
         await self._session.flush()
 
+    async def record_failure(self, source: str) -> None:
+        row = await self._session.get(SyncState, source)
+        if row is None:
+            row = SyncState(source=source, last_attempted_sync=datetime.now(timezone.utc), status="failed")
+            self._session.add(row)
+        else:
+            row.status = "failed"
+        await self._session.flush()
+
 
 class InMemorySyncStateRepository:
     """Test double -- mirrors SqlAlchemySyncStateRepository without a database."""
 
     def __init__(self) -> None:
         self._store: dict[str, str | None] = {}
+        self.statuses: dict[str, str] = {}
 
     async def get_delta_link(self, source: str) -> str | None:
         return self._store.get(source)
 
     async def record_attempt(self, source: str) -> None:
-        pass  # nothing meaningful to track without real persistence
+        self.statuses[source] = "running"
 
     async def record_success(self, source: str, delta_link: str | None) -> None:
         self._store[source] = delta_link
+        self.statuses[source] = "ok"
+
+    async def record_failure(self, source: str) -> None:
+        self.statuses[source] = "failed"
 
 
 class ChunkRepository(Protocol):
@@ -414,6 +432,7 @@ class SqlAlchemyChunkRepository:
                 content=chunk.content,
                 token_count=chunk.token_count,
                 metadata_=chunk.metadata,
+                project_numbers=chunk.project_numbers,
             ))
         await self._session.flush()
 
@@ -431,6 +450,7 @@ class SqlAlchemyChunkRepository:
                 content=row.content,
                 token_count=row.token_count,
                 metadata=row.metadata_,
+                project_numbers=list(row.project_numbers or []),
             )
             for row in result.scalars().all()
         ]

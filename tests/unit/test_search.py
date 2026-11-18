@@ -74,3 +74,18 @@ async def test_query_embedding_gets_instruction_prefix_documents_do_not(monkeypa
     await provider.embed(["a passage"])
 
     assert seen == [["Query: find docker steps"], ["a passage"]]
+
+
+@pytest.mark.asyncio
+async def test_e5_style_prefixes_on_both_sides_never_mixed(monkeypatch):
+    from app.embeddings.sentence_transformer import SentenceTransformerProvider
+
+    seen: list[list[str]] = []
+    provider = SentenceTransformerProvider("m", query_instruction="query: ", passage_prefix="passage: ")
+    monkeypatch.setattr(provider, "_encode", lambda texts: seen.append(texts) or [[0.0]] * len(texts))
+
+    await provider.embed_query("Wie beantrage ich Urlaub?")
+    await provider.embed(["Leave announcement flow", "Calendar booking"])
+
+    # The query must not also get the passage prefix, and vice versa.
+    assert seen == [["query: Wie beantrage ich Urlaub?"], ["passage: Leave announcement flow", "passage: Calendar booking"]]

@@ -19,8 +19,9 @@ models aren't comparable.
 from __future__ import annotations
 
 import enum
+import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlalchemy import Select, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,9 @@ from app.db.models import Chunk as ChunkModel
 from app.db.models import Document, SourceType
 from app.embeddings.base import EmbeddingProvider
 from app.embeddings.text import section_label
+from app.observability import RERANK_SECONDS, RETRIEVAL_SECONDS
+from app.project_numbers import extract_project_numbers
+from app.retrieval.rerank import Reranker
 
 # Standard RRF constant (Cormack et al.); dampens the advantage of rank 1
 # over rank 2 so one list can't dominate the fusion on its own.
@@ -47,6 +51,8 @@ class SearchFilters:
     source_type: SourceType | None = None
     extensions: list[str] = field(default_factory=list)
     path_contains: str | None = None
+    # Only chunks tagged with any of these 8-digit project numbers.
+    project_numbers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -65,6 +71,9 @@ class SearchResult:
     similarity: float | None = None
     semantic_rank: int | None = None
     keyword_rank: int | None = None
+    # Cross-encoder relevance (0..1) when reranking ran; becomes `score`.
+    rerank_score: float | None = None
+    project_numbers: list[str] = field(default_factory=list)
 
 
 def reciprocal_rank_fusion(rankings: list[list[uuid.UUID]], k: int = RRF_K) -> list[tuple[uuid.UUID, float]]:
@@ -98,6 +107,9 @@ def _base_query(model_name: str, filters: SearchFilters) -> Select:
         # autoescape: "_" and "%" in user input (e.g. "02_Development")
         # match literally instead of acting as LIKE wildcards.
         stmt = stmt.where(Document.path.icontains(filters.path_contains, autoescape=True))
+    if filters.project_numbers:
+        # Postgres array overlap (&&), served by the GIN index.
+        stmt = stmt.where(ChunkModel.project_numbers.overlap(filters.project_numbers))
     return stmt
 
 
@@ -147,7 +159,46 @@ def _to_result(chunk: ChunkModel, document: Document, score: float) -> SearchRes
         source_type=source_type.value if isinstance(source_type, SourceType) else str(source_type),
         section=section_label(chunk.metadata_ or {}),
         score=score,
+        project_numbers=list(chunk.project_numbers or []),
     )
+
+
+def rerank_passage(result: SearchResult) -> str:
+    # Same document/section context the chunk was embedded with: the
+    # chunker strips headings out of content, and the reranker should see
+    # them too (e.g. a "Required Permissions" heading is the whole clue).
+    context = " > ".join(part for part in (result.name, result.section) if part)
+    return f"{context}\n{result.content}" if context else result.content
+
+
+async def rerank_results(
+    reranker: Reranker,
+    query: str,
+    results: list[SearchResult],
+    top_k: int,
+    min_relevance: float | None = None,
+) -> list[SearchResult]:
+    """
+    Reorders candidates by cross-encoder relevance, drops any below
+    min_relevance, and keeps top_k. Dropping can leave zero results --
+    deliberately: for RAG, "nothing relevant" must reach the caller as an
+    empty list so no answer gets generated from irrelevant context.
+    """
+    if not results:
+        return []
+    started = time.perf_counter()
+    try:
+        scores = await reranker.score(query, [rerank_passage(r) for r in results])
+    finally:
+        RERANK_SECONDS.observe(time.perf_counter() - started)
+    for result, relevance in zip(results, scores):
+        result.rerank_score = relevance
+        result.score = relevance
+    # Stable sort: equal relevance keeps the retrieval order.
+    ranked = sorted(results, key=lambda r: r.rerank_score, reverse=True)
+    if min_relevance is not None:
+        ranked = [r for r in ranked if r.rerank_score >= min_relevance]
+    return ranked[:top_k]
 
 
 async def search_chunks(
@@ -157,6 +208,34 @@ async def search_chunks(
     top_k: int = 5,
     mode: SearchMode = SearchMode.hybrid,
     filters: SearchFilters | None = None,
+    reranker: Reranker | None = None,
+    rerank_candidates: int = 30,
+    min_relevance: float | None = None,
+) -> list[SearchResult]:
+    """
+    Without a reranker: the top_k of hybrid/semantic retrieval. With one:
+    retrieval fetches max(rerank_candidates, top_k) candidates, the
+    reranker reorders them, and the best top_k (at or above min_relevance,
+    if set) are returned.
+    """
+    started = time.perf_counter()
+    try:
+        pool_size = max(rerank_candidates, top_k) if reranker is not None else top_k
+        results = await _search_chunks(session, provider, query, pool_size, mode, filters)
+    finally:
+        RETRIEVAL_SECONDS.labels(mode=mode.value).observe(time.perf_counter() - started)
+    if reranker is None:
+        return results
+    return await rerank_results(reranker, query, results, top_k, min_relevance)
+
+
+async def _search_chunks(
+    session: AsyncSession,
+    provider: EmbeddingProvider,
+    query: str,
+    top_k: int,
+    mode: SearchMode,
+    filters: SearchFilters | None,
 ) -> list[SearchResult]:
     filters = filters or SearchFilters()
     query = query.strip()
@@ -203,3 +282,71 @@ async def search_chunks(
         result.keyword_rank = keyword_rank.get(chunk_id)
         results.append(result)
     return results
+
+
+@dataclass
+class ProjectScope:
+    """How a project-number restriction was applied to one search."""
+
+    project_numbers: list[str]
+    # True when the caller asked for these numbers explicitly (e.g. --project);
+    # False when they were detected in the query text.
+    explicit: bool
+    # True when no indexed content is tagged with these numbers at all, so
+    # the search ran unrestricted instead. Never set for explicit scopes.
+    fell_back: bool = False
+
+
+@dataclass
+class ScopedSearch:
+    results: list[SearchResult]
+    scope: ProjectScope | None = None
+
+
+async def _project_has_content(session: AsyncSession, model_name: str, filters: SearchFilters) -> bool:
+    stmt = _base_query(model_name, filters).with_only_columns(ChunkModel.id).limit(1)
+    return (await session.execute(stmt)).first() is not None
+
+
+async def scoped_search(
+    session: AsyncSession,
+    provider: EmbeddingProvider,
+    query: str,
+    top_k: int = 5,
+    mode: SearchMode = SearchMode.hybrid,
+    filters: SearchFilters | None = None,
+    reranker: Reranker | None = None,
+    rerank_candidates: int = 30,
+    min_relevance: float | None = None,
+) -> ScopedSearch:
+    """
+    search_chunks plus project-number scoping. Project numbers come from
+    filters.project_numbers (explicit) or, failing that, from the query
+    text itself; either way the search is restricted to chunks tagged with
+    them, so an answer about one project can't mix in another's content.
+
+    Falls back to an unrestricted search only when nothing indexed is
+    tagged with the detected numbers at all (likely a typo, or a project
+    not documented yet) -- and reports it via scope.fell_back. If the
+    project HAS content but none of it is relevant, the empty result
+    stands: widening to other projects is exactly what restriction forbids.
+    Explicit scopes never fall back.
+    """
+    filters = filters or SearchFilters()
+    explicit = bool(filters.project_numbers)
+    numbers = filters.project_numbers or extract_project_numbers(query)
+
+    def run(f: SearchFilters):
+        return search_chunks(
+            session, provider, query, top_k=top_k, mode=mode, filters=f,
+            reranker=reranker, rerank_candidates=rerank_candidates, min_relevance=min_relevance,
+        )
+
+    if not numbers:
+        return ScopedSearch(await run(filters))
+
+    scoped = replace(filters, project_numbers=numbers)
+    if explicit or await _project_has_content(session, provider.model_name, scoped):
+        return ScopedSearch(await run(scoped), ProjectScope(numbers, explicit=explicit))
+
+    return ScopedSearch(await run(filters), ProjectScope(numbers, explicit=False, fell_back=True))
