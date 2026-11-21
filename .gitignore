@@ -10,3 +10,6 @@ backups/
 CLAUDE.md
 SHAREPOINT_AGENT_INTEGRATION.md
 Auximo_Knowledge_Agent_Implementation_Spec.md
+.env.example
+HOW_TO_USE_LOCALLY.md
+Auximo_Knowledge_Agent_Implementation_Spec.md
